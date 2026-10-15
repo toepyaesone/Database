@@ -319,3 +319,74 @@ def compare_data_fast(dfExcel: pd.DataFrame, dfSupabase: pd.DataFrame, id_col: s
                     records.append([pid, col, subE.at[pid, col], subS.at[pid, col]])
 
     return pd.DataFrame(records, columns=["PatientID", "ColumnName", "Value_Excel", "Value_Supabase"])
+
+# Add to the bottom of functions.py
+
+def fetch_supabase_by_ids(
+    tableName: str,
+    id_list: list,
+    url: str,
+    key: str,
+    access_token: str = None,
+    id_col: str = "PatientID",
+    chunk_size: int = 300,
+) -> pd.DataFrame:
+    """Fetches only the rows matching the PatientIDs in the uploaded Excel file."""
+    if not id_list:
+        return pd.DataFrame()
+
+    auth_token = access_token if access_token else key.strip()
+    headers = {
+        "apikey": key.strip(),
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+    }
+    session = get_working_session(url, headers)
+    all_rows = []
+    clean_ids = [str(x).strip() for x in id_list if pd.notna(x) and str(x).strip()]
+
+    for i in range(0, len(clean_ids), chunk_size):
+        batch = clean_ids[i : i + chunk_size]
+        formatted_ids = ",".join(batch)
+        endpoint = f"{url.rstrip('/')}/rest/v1/{tableName}?{id_col}=in.({formatted_ids})&select=*"
+        res = session.get(endpoint, headers=headers, timeout=20)
+        res.raise_for_status()
+        data = res.json()
+        if data:
+            all_rows.extend(data)
+
+    return pd.DataFrame(all_rows)
+
+
+def fetch_all_patient_ids_only(
+    tableName: str, url: str, key: str, access_token: str = None, id_col: str = "PatientID", page_size: int = 5000
+) -> set:
+    """Lightweight fetch of ONLY the PatientID column (~98% less RAM than SELECT *)."""
+    endpoint = f"{url.rstrip('/')}/rest/v1/{tableName}?select={id_col}"
+    auth_token = access_token if access_token else key.strip()
+    headers = {
+        "apikey": key.strip(),
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+    }
+    session = get_working_session(url, headers)
+    all_ids = set()
+    start_index = 0
+
+    while True:
+        page_headers = headers.copy()
+        page_headers["Range"] = f"{start_index}-{start_index + page_size - 1}"
+        res = session.get(endpoint, headers=page_headers, timeout=15)
+        res.raise_for_status()
+        chunk = res.json()
+        if not chunk:
+            break
+        for row in chunk:
+            val = row.get(id_col)
+            if val is not None and str(val).strip():
+                all_ids.add(str(val).strip())
+        if len(chunk) < page_size:
+            break
+        start_index += page_size
+
+    return all_ids
