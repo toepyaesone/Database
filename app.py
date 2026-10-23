@@ -1,6 +1,6 @@
-
 import os
 import re
+import gc
 import difflib
 import warnings
 from io import BytesIO
@@ -36,6 +36,8 @@ st.set_page_config(
     page_icon="🩺",
     layout="wide",
 )
+
+SUPABASE_DEFAULT_TABLE = "ygntbpro"
 
 
 # ==============================================================================
@@ -88,7 +90,10 @@ class NameFeatureExtractor(BaseEstimator, TransformerMixin):
 
 
 def build_gender_pipeline(n_estimators: int = 200, random_state: int = 42) -> Pipeline:
-    """Create a scikit-learn Pipeline combining character TF-IDF and custom name features."""
+    """
+    Create a scikit-learn Pipeline combining character TF-IDF and custom name features.
+    Uses n_jobs=2 instead of -1 to prevent CPU/RAM thread exhaustion on Streamlit Cloud.
+    """
     combined_features = FeatureUnion(
         transformer_list=[
             (
@@ -107,7 +112,7 @@ def build_gender_pipeline(n_estimators: int = 200, random_state: int = 42) -> Pi
                 RandomForestClassifier(
                     n_estimators=n_estimators,
                     random_state=random_state,
-                    n_jobs=-1,
+                    n_jobs=2,
                 ),
             ),
         ]
@@ -174,7 +179,7 @@ def run_gender_prediction_check(
 # 3. SUPABASE & EXCEL LOADING HELPERS
 # ==============================================================================
 def get_default_supabase_credentials():
-    """Retrieve Supabase URL and Key from Streamlit secrets or environment variables."""
+    """Retrieve Supabase URL and Key from Streamlit secrets, environment variables, or project defaults."""
     url = "https://kocihpxevlowqbguhstf.supabase.co"
     key = "sb_publishable_JtrNLjMNSvZ5LzvXKbv2xw_mj-hl5MD"
     try:
@@ -182,39 +187,50 @@ def get_default_supabase_credentials():
             url = st.secrets["SUPABASE_URL"]
         if "SUPABASE_KEY" in st.secrets:
             key = st.secrets["SUPABASE_KEY"]
-        if (not url or not key) and "supabase" in st.secrets:
+        if "supabase" in st.secrets:
             supa_sec = st.secrets["supabase"]
-            url = url or supa_sec.get("url", "") or supa_sec.get("SUPABASE_URL", "")
-            key = key or supa_sec.get("key", "") or supa_sec.get("SUPABASE_KEY", "")
-        if (not url or not key) and "connections" in st.secrets and "supabase" in st.secrets["connections"]:
+            url = supa_sec.get("url", "") or supa_sec.get("SUPABASE_URL", "") or url
+            key = supa_sec.get("key", "") or supa_sec.get("SUPABASE_KEY", "") or key
+        if "connections" in st.secrets and "supabase" in st.secrets["connections"]:
             conn_sec = st.secrets["connections"]["supabase"]
-            url = url or conn_sec.get("SUPABASE_URL", "") or conn_sec.get("url", "")
-            key = key or conn_sec.get("SUPABASE_KEY", "") or conn_sec.get("key", "")
+            url = conn_sec.get("SUPABASE_URL", "") or conn_sec.get("url", "") or url
+            key = conn_sec.get("SUPABASE_KEY", "") or conn_sec.get("key", "") or key
     except Exception:
         pass
 
-    url = url or os.environ.get("SUPABASE_URL", "")
-    key = key or os.environ.get("SUPABASE_KEY", "")
+    url = os.environ.get("SUPABASE_URL", "") or url
+    key = os.environ.get("SUPABASE_KEY", "") or key
     return url, key
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_supabase_table(
-    supabase_url: str, supabase_key: str, table_name: str = "ygntbpro", batch_size: int = 1000
-) -> pd.DataFrame:
-    """Fetch all rows from a Supabase table using pagination to bypass the 1,000-row limit."""
+@st.cache_resource(show_spinner=False)
+def get_supabase_client(supabase_url: str, supabase_key: str):
+    """Create and cache a single Supabase client instance across reruns."""
     from supabase import create_client
+    return create_client(supabase_url.strip(), supabase_key.strip())
 
+
+@st.cache_data(ttl=600, max_entries=3, show_spinner=False)
+def fetch_supabase_table(
+    supabase_url: str,
+    supabase_key: str,
+    table_name: str = SUPABASE_DEFAULT_TABLE,
+    batch_size: int = 1000,
+) -> pd.DataFrame:
+    """
+    Fetch all rows from Supabase table `ygntbpro` (which stores the merged data of
+    `YgnTBPro` and `Notified TB Register`) using pagination to bypass the 1,000-row limit.
+    """
     if not supabase_url or not supabase_key:
         raise ValueError("Supabase URL and Key are required.")
 
-    client = create_client(supabase_url.strip(), supabase_key.strip())
+    client = get_supabase_client(supabase_url, supabase_key)
     all_rows = []
     start = 0
 
     while True:
         response = (
-            client.table(table_name)
+            client.table(table_name.strip())
             .select("*")
             .range(start, start + batch_size - 1)
             .execute()
@@ -231,7 +247,7 @@ def fetch_supabase_table(
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(max_entries=2, show_spinner=False)
 def read_excel_workbook_sheets(
     file_bytes: bytes, candidate_sheets: list[str] | None = None
 ) -> dict[str, pd.DataFrame]:
@@ -359,6 +375,36 @@ DTYPE_CHANGE_MAP = {
     "OutcomeDate": "datetime64[ns]", "TypeofTBTreatment": "Int64", "SheetName_x": "string",
 }
 
+# Build case-insensitive lookup map so lowercase Postgres column names map cleanly to expected names
+CANONICAL_COL_LOOKUP = {k.lower(): k for k in DTYPE_CHANGE_MAP.keys()}
+CANONICAL_COL_LOOKUP.update(
+    {
+        "patientid": "PatientID",
+        "name": "Name",
+        "age": "Age",
+        "sex": "Sex",
+        "date": "Date",
+        "address": "Address",
+        "ptstsp": "Ptstsp",
+        "phoneno": "PhoneNo",
+        "remark": "Remark",
+        "nationality": "Nationality",
+        "sheetname": "SheetName",
+    }
+)
+
+
+def align_canonical_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Align column casing with expected schema names (handles lowercase Postgres headers)."""
+    df_out = df.copy()
+    new_cols = []
+    for c in df_out.columns:
+        cleaned = clean_column_name(c)
+        canonical = CANONICAL_COL_LOOKUP.get(cleaned.lower(), cleaned)
+        new_cols.append(canonical)
+    df_out.columns = new_cols
+    return df_out
+
 
 def changeDtype(df: pd.DataFrame) -> pd.DataFrame:
     """Convert DataFrame columns to their standardized nullable types."""
@@ -378,15 +424,15 @@ def changeDtype(df: pd.DataFrame) -> pd.DataFrame:
 
 def prepare_combined_dataframe(ygntbpro_df: pd.DataFrame, tb_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
-    Merge `YgnTBPro` and `Notified TB Register` (or standardize standalone `YgnTBPro` if `tb_df` is absent)
-    so all `_x` and `_y` columns expected by `TBDataValidator` exist.
+    Prepare the combined DataFrame for PPM validation:
+    - When loading from Excel (`YgnTBPro` + `Notified TB Register`), merges both sheets on `PatientID`.
+    - When loading from Supabase `ygntbpro` (which is already the merged table of `YgnTBPro` and
+      `Notified TB Register`), aligns column names and ensures `_x` / `_y` columns are ready.
     """
-    ygn = ygntbpro_df.copy()
-    ygn.columns = [clean_column_name(c) for c in ygn.columns]
+    ygn = align_canonical_columns(ygntbpro_df)
 
     if tb_df is not None and not tb_df.empty:
-        tb = tb_df.copy()
-        tb.columns = [clean_column_name(c) for c in tb.columns]
+        tb = align_canonical_columns(tb_df)
         df_combined = pd.merge(ygn, tb, on="PatientID", how="outer", suffixes=("_x", "_y"))
     else:
         df_combined = ygn.copy()
@@ -407,7 +453,8 @@ def prepare_combined_dataframe(ygntbpro_df: pd.DataFrame, tb_df: pd.DataFrame | 
                 df_combined.rename(columns={orig_c: suff_c}, inplace=True)
 
     if not df_combined.empty:
-        df_combined.columns = [clean_column_name(col) for col in df_combined.columns]
+        df_combined = align_canonical_columns(df_combined)
+        df_combined = df_combined.loc[:, ~df_combined.columns.duplicated()].copy()
         df_combined = changeDtype(df_combined)
         for col in ["EPI11", "TB11", "SDG_EPI", "SDG_TB"]:
             if col in df_combined.columns:
@@ -909,10 +956,11 @@ class TBDataValidator:
         return df_val
 
 
-def fuzzyMatchingData(dfmata: pd.DataFrame, score_threshold: int = 85) -> pd.DataFrame:
+def fuzzyMatchingData(dfmata: pd.DataFrame, score_threshold: int = 85, chunk_size: int = 500) -> pd.DataFrame:
     """
-    Fast fuzzy duplicate detection using `rapidfuzz.process.cdist` (C++ multithreaded)
-    and safe attribute comparison without fragile underscore string-splitting.
+    Memory-safe, chunked fuzzy duplicate detection.
+    Processes `chunk_size` rows at a time with uint8 scores instead of allocating a giant
+    N x N matrix and `np.triu_indices(N)` in memory (which caused OOM / connection reset on Streamlit Cloud).
     """
     empty_cols = [
         "Score", "ID", "SimilarID", "Patient", "SimilarPatient", "ScoreAddress",
@@ -929,7 +977,8 @@ def fuzzyMatchingData(dfmata: pd.DataFrame, score_threshold: int = 85) -> pd.Dat
         return pd.DataFrame(columns=empty_cols)
 
     df_sub = dfmata[pd.to_numeric(dfmata["Reasonforexamination"], errors="coerce") == 1].copy()
-    if len(df_sub) < 2:
+    n_rows = len(df_sub)
+    if n_rows < 2:
         return pd.DataFrame(columns=empty_cols)
 
     df_sub.reset_index(drop=True, inplace=True)
@@ -950,35 +999,7 @@ def fuzzyMatchingData(dfmata: pd.DataFrame, score_threshold: int = 85) -> pd.Dat
     df_sub["Visit_no_int"] = pd.to_numeric(df_sub["Visit_no"], errors="coerce").fillna(0).astype(int)
 
     datacheck_values = df_sub["DataCheck"].tolist()
-
-    if HAS_RAPIDFUZZ:
-        scores_matrix = rf_process.cdist(
-            datacheck_values,
-            datacheck_values,
-            scorer=fuzz.ratio,
-            score_cutoff=score_threshold,
-            workers=-1,
-        )
-    else:
-        n = len(datacheck_values)
-        scores_matrix = np.zeros((n, n), dtype=float)
-        for i in range(n):
-            for j in range(i + 1, n):
-                s = difflib.SequenceMatcher(None, datacheck_values[i], datacheck_values[j]).ratio() * 100
-                if s >= score_threshold:
-                    scores_matrix[i, j] = s
-
-    triu_i, triu_j = np.triu_indices(len(datacheck_values), k=1)
-    pair_scores = scores_matrix[triu_i, triu_j]
-    qualifying_mask = pair_scores >= score_threshold
-    idx_i = triu_i[qualifying_mask]
-    idx_j = triu_j[qualifying_mask]
-
-    if len(idx_i) == 0:
-        return pd.DataFrame(columns=empty_cols)
-
     pids = df_sub["PatientID"].astype(str).tolist()
-    datachecks = datacheck_values
     addresses = df_sub["Address_x"].fillna("").astype(str).tolist()
     visits = df_sub["Visit_no_int"].tolist()
     names = df_sub["Name_x"].tolist()
@@ -988,41 +1009,91 @@ def fuzzyMatchingData(dfmata: pd.DataFrame, score_threshold: int = 85) -> pd.Dat
     rfes = df_sub["Reasonforexamination"].tolist()
 
     results = []
-    for i, j in zip(idx_i, idx_j):
-        score = float(scores_matrix[i, j])
-        addr_i, addr_j = addresses[i], addresses[j]
-        score_addr = (
-            float(fuzz.ratio(addr_i, addr_j))
-            if HAS_RAPIDFUZZ
-            else round(difflib.SequenceMatcher(None, addr_i, addr_j).ratio() * 100, 1)
-        )
 
-        match_flags = {
-            "Name": names[i] == names[j],
-            "Age": ages[i] == ages[j],
-            "Sex": sexes[i] == sexes[j],
-            "Tsp": tsps[i] == tsps[j],
-            "ReasonForExamination": rfes[i] == rfes[j],
-        }
-        matched_attrs = [k for k, is_match in match_flags.items() if is_match]
+    for start_idx in range(0, n_rows, chunk_size):
+        end_idx = min(start_idx + chunk_size, n_rows)
+        chunk_queries = datacheck_values[start_idx:end_idx]
 
-        results.append(
-            {
-                "Score": round(score, 1),
-                "ID": pids[i],
-                "SimilarID": pids[j],
-                "Patient": datachecks[i],
-                "SimilarPatient": datachecks[j],
-                "ScoreAddress": round(score_addr, 1),
-                "Address": addr_i,
-                "SimilarAddress": addr_j,
-                "Visit1": visits[i],
-                "Visit2": visits[j],
-                "Duration": abs(visits[j] - visits[i]),
-                **match_flags,
-                "Analysis": matched_attrs,
-            }
-        )
+        if HAS_RAPIDFUZZ:
+            scores_chunk = rf_process.cdist(
+                chunk_queries,
+                datacheck_values,
+                scorer=fuzz.ratio,
+                score_cutoff=score_threshold,
+                dtype=np.uint8,
+                workers=1,
+            )
+            rel_is, js = np.where(scores_chunk >= score_threshold)
+            for rel_i, j in zip(rel_is, js):
+                i = start_idx + int(rel_i)
+                j = int(j)
+                if j <= i:
+                    continue
+                score = float(scores_chunk[rel_i, j])
+                addr_i, addr_j = addresses[i], addresses[j]
+                score_addr = float(fuzz.ratio(addr_i, addr_j))
+
+                match_flags = {
+                    "Name": names[i] == names[j],
+                    "Age": ages[i] == ages[j],
+                    "Sex": sexes[i] == sexes[j],
+                    "Tsp": tsps[i] == tsps[j],
+                    "ReasonForExamination": rfes[i] == rfes[j],
+                }
+                matched_attrs = [k for k, is_match in match_flags.items() if is_match]
+                results.append(
+                    {
+                        "Score": round(score, 1),
+                        "ID": pids[i],
+                        "SimilarID": pids[j],
+                        "Patient": datacheck_values[i],
+                        "SimilarPatient": datacheck_values[j],
+                        "ScoreAddress": round(score_addr, 1),
+                        "Address": addr_i,
+                        "SimilarAddress": addr_j,
+                        "Visit1": visits[i],
+                        "Visit2": visits[j],
+                        "Duration": abs(visits[j] - visits[i]),
+                        **match_flags,
+                        "Analysis": matched_attrs,
+                    }
+                )
+        else:
+            for rel_i, q_val in enumerate(chunk_queries):
+                i = start_idx + rel_i
+                for j in range(i + 1, n_rows):
+                    score = difflib.SequenceMatcher(None, q_val, datacheck_values[j]).ratio() * 100
+                    if score >= score_threshold:
+                        addr_i, addr_j = addresses[i], addresses[j]
+                        score_addr = difflib.SequenceMatcher(None, addr_i, addr_j).ratio() * 100
+                        match_flags = {
+                            "Name": names[i] == names[j],
+                            "Age": ages[i] == ages[j],
+                            "Sex": sexes[i] == sexes[j],
+                            "Tsp": tsps[i] == tsps[j],
+                            "ReasonForExamination": rfes[i] == rfes[j],
+                        }
+                        matched_attrs = [k for k, is_match in match_flags.items() if is_match]
+                        results.append(
+                            {
+                                "Score": round(score, 1),
+                                "ID": pids[i],
+                                "SimilarID": pids[j],
+                                "Patient": datacheck_values[i],
+                                "SimilarPatient": datacheck_values[j],
+                                "ScoreAddress": round(score_addr, 1),
+                                "Address": addr_i,
+                                "SimilarAddress": addr_j,
+                                "Visit1": visits[i],
+                                "Visit2": visits[j],
+                                "Duration": abs(visits[j] - visits[i]),
+                                **match_flags,
+                                "Analysis": matched_attrs,
+                            }
+                        )
+
+    if not results:
+        return pd.DataFrame(columns=empty_cols)
 
     df_result = pd.DataFrame(results)
     df_result.sort_values(by="Score", ascending=False, ignore_index=True, inplace=True)
@@ -1081,9 +1152,10 @@ def compute_unique_values_table(df_combined: pd.DataFrame) -> pd.DataFrame:
 
 
 DATE_COLUMNS = [
-    "Date", "RegistrarDate", "CPT", "ART", "Tx_Outcome_Date", "DOTStartedDate111", "TPTregistrationdate",
-    "Drugpickup1", "Date_drug_pickup2", "Date_drug_pickup_3", "Date_drug_pickup_4", "Date_drug_pickup_5",
-    "Date_drug_pickup_6", "Date_drug_pickup_7", "Date_drug_pickup_8", "Date_drug_pickup_9",
+    "Date", "Date_x", "Date_y", "RegistrarDate", "CPT", "ART", "Tx_Outcome_Date",
+    "DOTStartedDate111", "TPTregistrationdate", "Drugpickup1", "Date_drug_pickup2",
+    "Date_drug_pickup_3", "Date_drug_pickup_4", "Date_drug_pickup_5", "Date_drug_pickup_6",
+    "Date_drug_pickup_7", "Date_drug_pickup_8", "Date_drug_pickup_9",
     "TPTdiscontinuationdate", "OutcomeDate",
 ]
 
@@ -1216,11 +1288,32 @@ def compare_workbook_dicts(df_dict_curr: dict[str, pd.DataFrame], df_dict_prev: 
 # 5. CBTBC (PGK DATA VERIFICATION) HELPERS
 # ==============================================================================
 def clean_mata_supabase_df(df_raw: pd.DataFrame, filter_vol_only: bool = True) -> pd.DataFrame:
-    """Clean and standardize the Supabase `YgnTBPro` DataFrame for CBTBC (PGK) comparison."""
+    """
+    Clean and standardize the Supabase `ygntbpro` DataFrame (which merges `YgnTBPro` and
+    `Notified TB Register`) for CBTBC (PGK) comparison.
+    Maps `_x` columns (`Name_x`, `Age_x`, `Sex_x`, `Date_x`) to standard names (`Name`, `Age`, `Sex`, `Date`).
+    """
     if df_raw is None or df_raw.empty:
         return pd.DataFrame()
 
-    dfmata = df_raw.copy()
+    dfmata = align_canonical_columns(df_raw)
+
+    # Since Supabase `ygntbpro` is the merged table of YgnTBPro & Notified TB Register,
+    # map `_x` columns to unsuffixed names if unsuffixed columns are absent
+    merged_to_base_map = {
+        "Name_x": "Name",
+        "Age_x": "Age",
+        "Sex_x": "Sex",
+        "Date_x": "Date",
+        "Address_x": "Address",
+        "Ptstsp_x": "Ptstsp",
+        "PhoneNo_x": "PhoneNo",
+        "Remark_x": "Remark",
+    }
+    for suff_col, base_col in merged_to_base_map.items():
+        if suff_col in dfmata.columns and base_col not in dfmata.columns:
+            dfmata[base_col] = dfmata[suff_col]
+
     if filter_vol_only and "VOL" in dfmata.columns:
         dfmata = dfmata[pd.to_numeric(dfmata["VOL"], errors="coerce") == 1].copy()
 
@@ -1236,13 +1329,18 @@ def clean_mata_supabase_df(df_raw: pd.DataFrame, filter_vol_only: bool = True) -
 
     extra_cols = [c for c in dfmata.columns if c not in expected_columns]
     dfmata = dfmata[expected_columns + extra_cols].copy()
+    dfmata = dfmata.loc[:, ~dfmata.columns.duplicated()].copy()
 
-    dfmata["Sex"] = dfmata["Sex"].replace({1: "M", 2: "F", "1": "M", "2": "F"})
+    dfmata["Sex"] = dfmata["Sex"].replace({1: "M", 2: "F", "1": "M", "2": "F", "1.0": "M", "2.0": "F"})
     dfmata["Referralfor"] = dfmata["Referralfor"].replace(
-        {1: "Presumptive", 2: "CI", "1": "Presumptive", "2": "CI"}
+        {1: "Presumptive", 2: "CI", "1": "Presumptive", "2": "CI", "1.0": "Presumptive", "2.0": "CI"}
     )
     dfmata["TypeofTBTreatment"] = dfmata["TypeofTBTreatment"].replace(
-        {1: "DS-TB", 2: "DR-TB", 3: "TPT", "1": "DS-TB", "2": "DR-TB", "3": "TPT"}
+        {
+            1: "DS-TB", 2: "DR-TB", 3: "TPT",
+            "1": "DS-TB", "2": "DR-TB", "3": "TPT",
+            "1.0": "DS-TB", "2.0": "DR-TB", "3.0": "TPT",
+        }
     )
 
     dfmata = dfmata[
@@ -1251,7 +1349,7 @@ def clean_mata_supabase_df(df_raw: pd.DataFrame, filter_vol_only: bool = True) -
     return dfmata
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(max_entries=2, show_spinner=False)
 def load_and_clean_pgk_excel(file_bytes: bytes) -> pd.DataFrame:
     """Read `Presumptive` and `CI` sheets from CBTBC / PGK Excel bytes and standardize column names."""
     required_sheets = ["Presumptive", "CI"]
@@ -1456,18 +1554,24 @@ def run_pairwise_verification(
 # ==============================================================================
 # 6. INITIALIZE SESSION STATE & SHARED SIDEBAR SETTINGS
 # ==============================================================================
-if "gender_model" not in st.session_state:
+@st.cache_resource(show_spinner=False)
+def load_default_gender_model():
+    """Load `gender_predictor_model.pkl` once across sessions if present in repository."""
     default_model_path = Path("gender_predictor_model.pkl")
     if default_model_path.exists():
         try:
-            st.session_state["gender_model"] = joblib.load(default_model_path)
-            st.session_state["gender_model_source"] = "Loaded from gender_predictor_model.pkl"
+            return joblib.load(default_model_path)
         except Exception:
-            st.session_state["gender_model"] = None
-            st.session_state["gender_model_source"] = "Not loaded"
-    else:
-        st.session_state["gender_model"] = None
-        st.session_state["gender_model_source"] = "Not loaded"
+            return None
+    return None
+
+
+if "gender_model" not in st.session_state:
+    cached_model = load_default_gender_model()
+    st.session_state["gender_model"] = cached_model
+    st.session_state["gender_model_source"] = (
+        "Loaded from gender_predictor_model.pkl" if cached_model is not None else "Not loaded"
+    )
 
 default_url, default_key = get_default_supabase_credentials()
 
@@ -1482,11 +1586,12 @@ with st.sidebar:
         "Supabase Key",
         value=default_key,
         type="password",
-        placeholder="Enter Supabase anon / service_role key",
+        placeholder="Enter Supabase publishable / anon key",
     )
 
     if st.button("🔄 Refresh Supabase Cache", use_container_width=True):
         fetch_supabase_table.clear()
+        gc.collect()
         st.rerun()
 
     st.divider()
@@ -1513,85 +1618,35 @@ def page_ppm_database_verification():
     """Page 1: PPM (Database Verification)"""
     st.title("📋 Page 1: PPM (Database Verification)")
     st.caption(
-        "Verify PPM / MATA database records (`CheckData`, `CheckGender`, `CheckDuplication`, `CheckDifference`, and `checkUnique`) "
-        "by selecting either the existing **Supabase (`YgnTBPro`)** database or uploading an **Excel Report**, and export all verification sheets to Excel."
+        "Verify PPM / MATA database records (`CheckData`, `CheckGender`, `CheckDuplication`, `CheckDifference`, and `checkUnique`). "
+        "Supabase table **`ygntbpro`** already merges `YgnTBPro` and `Notified TB Register`."
     )
 
-    src_col1, src_col2, src_col3 = st.columns([2, 2, 1])
+    src_col1, src_col2, src_col3 = st.columns([2, 1, 1])
     with src_col1:
         verification_source = st.radio(
             "Select Source Data for PPM Verification",
-            options=["Existing Supabase Data (YgnTBPro)", "Upload Excel File"],
+            options=["Existing Supabase Data (ygntbpro)", "Upload Excel File"],
             horizontal=True,
         )
     with src_col2:
         target_year = st.number_input("Target Validation Year", min_value=2020, max_value=2035, value=2026, step=1)
     with src_col3:
-        run_fuzzy_dup = st.checkbox("Run Fuzzy Duplication", value=True, help="Uses C++ multithreaded rapidfuzz.cdist")
+        run_fuzzy_dup = st.checkbox("Run Fuzzy Duplication", value=True, help="Memory-safe chunked rapidfuzz search")
 
-    df_dict_current: dict[str, pd.DataFrame] = {}
-    df_combined = pd.DataFrame()
-
-    if verification_source == "Existing Supabase Data (YgnTBPro)":
-        supa_c1, supa_c2 = st.columns(2)
-        with supa_c1:
-            supa_ygn_table = st.text_input("Supabase Main Table Name", value="ygntbpro", placeholder="e.g., ygntbpro")
-        with supa_c2:
-            supa_tb_table = st.text_input(
-                "Optional Supabase Notified TB Register Table (leave blank if standalone YgnTBPro)",
-                value="",
-                placeholder="e.g., Notified_TB_Register",
-            )
-
-        if not supabase_url or not supabase_key:
-            st.warning("Please enter your Supabase URL and Key in the sidebar (or configure `st.secrets`).")
-        else:
-            try:
-                with st.spinner(f"Loading `{supa_ygn_table}` from Supabase..."):
-                    ygn_df = fetch_supabase_table(supabase_url, supabase_key, table_name=supa_ygn_table.strip())
-                    df_dict_current["YgnTBPro"] = ygn_df
-
-                tb_df = None
-                if supa_tb_table.strip():
-                    with st.spinner(f"Loading `{supa_tb_table.strip()}` from Supabase..."):
-                        tb_df = fetch_supabase_table(supabase_url, supabase_key, table_name=supa_tb_table.strip())
-                        df_dict_current["Notified TB Register"] = tb_df
-
-                df_combined = prepare_combined_dataframe(ygn_df, tb_df)
-                st.success(f"Loaded **{len(df_combined):,}** records from Supabase.")
-            except Exception as exc:
-                st.error(f"Error loading from Supabase: {exc}")
-
+    if verification_source == "Existing Supabase Data (ygntbpro)":
+        supa_ygn_table = st.text_input(
+            "Supabase Merged Table Name (`YgnTBPro` + `Notified TB Register`)",
+            value=SUPABASE_DEFAULT_TABLE,
+        )
+        uploaded_curr_excel = None
     else:
+        supa_ygn_table = SUPABASE_DEFAULT_TABLE
         uploaded_curr_excel = st.file_uploader(
             "Upload Current PPM / MATA Report Excel Workbook (.xlsx, .xls, .xlsm)",
             type=["xlsx", "xls", "xlsm"],
             key="curr_report_uploader",
         )
-        if uploaded_curr_excel is not None:
-            try:
-                with st.spinner("Reading sheets from uploaded Current Report Excel..."):
-                    expected_sheets = [
-                        "YgnTBPro",
-                        "Presumptive Register",
-                        "Notified TB Register",
-                        "Outcome",
-                        "TPT Register",
-                    ]
-                    df_dict_current = read_excel_workbook_sheets(
-                        uploaded_curr_excel.getvalue(), candidate_sheets=expected_sheets
-                    )
-                    if "YgnTBPro" in df_dict_current:
-                        df_combined = prepare_combined_dataframe(
-                            df_dict_current["YgnTBPro"],
-                            df_dict_current.get("Notified TB Register"),
-                        )
-                    st.success(
-                        f"Loaded sheets: **{', '.join(df_dict_current.keys())}** "
-                        f"({len(df_combined):,} combined rows)."
-                    )
-            except Exception as exc:
-                st.error(f"Failed to read Current Excel file: {exc}")
 
     with st.expander("📂 Optional: Upload Previous Report Excel Workbook (for `CheckDifference`)", expanded=False):
         uploaded_prev_excel = st.file_uploader(
@@ -1600,48 +1655,112 @@ def page_ppm_database_verification():
             key="prev_report_uploader",
         )
 
-    if not df_combined.empty:
-        with st.spinner("Running PPM database verification checks..."):
-            validator = TBDataValidator(target_year=int(target_year))
-            dfValidation = validator.validate(df_combined)
+    # On-demand button prevents heavy startup execution during Streamlit Cloud's /healthz check
+    run_ppm_btn = st.button("🚀 Load Data & Run PPM Verification", type="primary", use_container_width=True)
 
-            dfGenderPredictor = run_gender_prediction_check(
-                df_combined,
-                model=st.session_state.get("gender_model"),
-                id_col="PatientID",
-                name_col="Name_x",
-                sex_col="Sex_x",
-                min_confidence=0.5,
-            )
+    if run_ppm_btn:
+        df_dict_current: dict[str, pd.DataFrame] = {}
+        df_combined = pd.DataFrame()
 
-            if run_fuzzy_dup and "Reasonforexamination" in df_combined.columns:
-                dfpresumptive = df_combined[
-                    pd.to_numeric(df_combined["Reasonforexamination"], errors="coerce").isin([1, 2])
-                ].copy()
-                dfDuplication = fuzzyMatchingData(dfpresumptive, score_threshold=85)
+        if verification_source == "Existing Supabase Data (ygntbpro)":
+            if not supabase_url or not supabase_key:
+                st.warning("Please enter your Supabase URL and Key in the sidebar.")
             else:
-                dfDuplication = pd.DataFrame()
-
-            df_unique = compute_unique_values_table(df_combined)
-
-            if uploaded_prev_excel is not None:
                 try:
-                    df_dict_prev = read_excel_workbook_sheets(
-                        uploaded_prev_excel.getvalue(),
-                        candidate_sheets=[
+                    with st.spinner(f"Fetching merged table `{supa_ygn_table}` from Supabase..."):
+                        ygn_df = fetch_supabase_table(supabase_url, supabase_key, table_name=supa_ygn_table.strip())
+                        df_dict_current["YgnTBPro"] = ygn_df
+                        df_combined = prepare_combined_dataframe(ygn_df, None)
+                    st.success(f"Loaded **{len(df_combined):,}** merged records from Supabase `{supa_ygn_table}`.")
+                except Exception as exc:
+                    st.error(f"Error loading `{supa_ygn_table}` from Supabase: {exc}")
+        else:
+            if uploaded_curr_excel is None:
+                st.warning("Please upload a Current Report Excel file first.")
+            else:
+                try:
+                    with st.spinner("Reading sheets from uploaded Current Report Excel..."):
+                        expected_sheets = [
                             "YgnTBPro",
                             "Presumptive Register",
                             "Notified TB Register",
                             "Outcome",
                             "TPT Register",
-                        ],
-                    )
-                    df_diff = compare_workbook_dicts(df_dict_current, df_dict_prev)
+                        ]
+                        df_dict_current = read_excel_workbook_sheets(
+                            uploaded_curr_excel.getvalue(), candidate_sheets=expected_sheets
+                        )
+                        if "YgnTBPro" in df_dict_current:
+                            df_combined = prepare_combined_dataframe(
+                                df_dict_current["YgnTBPro"],
+                                df_dict_current.get("Notified TB Register"),
+                            )
+                        st.success(
+                            f"Loaded sheets: **{', '.join(df_dict_current.keys())}** "
+                            f"({len(df_combined):,} combined rows)."
+                        )
                 except Exception as exc:
-                    st.warning(f"Could not compute CheckDifference: {exc}")
+                    st.error(f"Failed to read Current Excel file: {exc}")
+
+        if not df_combined.empty:
+            with st.spinner("Running PPM database verification checks..."):
+                validator = TBDataValidator(target_year=int(target_year))
+                dfValidation = validator.validate(df_combined)
+
+                dfGenderPredictor = run_gender_prediction_check(
+                    df_combined,
+                    model=st.session_state.get("gender_model"),
+                    id_col="PatientID",
+                    name_col="Name_x",
+                    sex_col="Sex_x",
+                    min_confidence=0.5,
+                )
+
+                if run_fuzzy_dup and "Reasonforexamination" in df_combined.columns:
+                    dfpresumptive = df_combined[
+                        pd.to_numeric(df_combined["Reasonforexamination"], errors="coerce").isin([1, 2])
+                    ].copy()
+                    dfDuplication = fuzzyMatchingData(dfpresumptive, score_threshold=85)
+                else:
+                    dfDuplication = pd.DataFrame()
+
+                df_unique = compute_unique_values_table(df_combined)
+
+                if uploaded_prev_excel is not None:
+                    try:
+                        df_dict_prev = read_excel_workbook_sheets(
+                            uploaded_prev_excel.getvalue(),
+                            candidate_sheets=[
+                                "YgnTBPro",
+                                "Presumptive Register",
+                                "Notified TB Register",
+                                "Outcome",
+                                "TPT Register",
+                            ],
+                        )
+                        df_diff = compare_workbook_dicts(df_dict_current, df_dict_prev)
+                    except Exception as exc:
+                        st.warning(f"Could not compute CheckDifference: {exc}")
+                        df_diff = pd.DataFrame()
+                else:
                     df_diff = pd.DataFrame()
-            else:
-                df_diff = pd.DataFrame()
+
+                st.session_state["ppm_results"] = {
+                    "CheckData": dfValidation,
+                    "CheckGender": dfGenderPredictor,
+                    "CheckDuplication": dfDuplication,
+                    "CheckDifference": df_diff,
+                    "checkUnique": df_unique,
+                }
+                gc.collect()
+
+    if "ppm_results" in st.session_state:
+        res = st.session_state["ppm_results"]
+        dfValidation = res["CheckData"]
+        dfGenderPredictor = res["CheckGender"]
+        dfDuplication = res["CheckDuplication"]
+        df_diff = res["CheckDifference"]
+        df_unique = res["checkUnique"]
 
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("CheckData Issues", f"{len(dfValidation):,}")
@@ -1650,15 +1769,8 @@ def page_ppm_database_verification():
         k4.metric("CheckDifference Rows", f"{len(df_diff):,}")
         k5.metric("Unique Columns Profiled", f"{len(df_unique):,}")
 
-        verification_sheets = {
-            "CheckData": dfValidation,
-            "CheckGender": dfGenderPredictor,
-            "CheckDuplication": dfDuplication,
-            "CheckDifference": df_diff,
-            "checkUnique": df_unique,
-        }
         timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        excel_out_bytes = generate_multisheet_excel_bytes(verification_sheets)
+        excel_out_bytes = generate_multisheet_excel_bytes(res)
 
         st.download_button(
             label="📥 Generate & Download PPM Verification Excel (`CheckData`, `CheckGender`, `CheckDuplication`, `CheckDifference`, `checkUnique`)",
@@ -1695,7 +1807,7 @@ def page_ppm_database_verification():
             st.dataframe(dfDuplication, use_container_width=True, hide_index=True, height=480)
 
         with tab_diff:
-            if uploaded_prev_excel is None:
+            if df_diff.empty and uploaded_prev_excel is None:
                 st.info("Upload a Previous Report Excel file above to compare Current vs. Previous sheets.")
             else:
                 st.dataframe(df_diff, use_container_width=True, hide_index=True, height=480)
@@ -1708,34 +1820,36 @@ def page_cbtbc_pgk_verification():
     """Page 2: CBTBC (PGK Data Verification)"""
     st.title("🔄 Page 2: CBTBC (PGK Data Verification)")
     st.caption(
-        "Automatically selects MATA data from Supabase table `YgnTBPro`, pairs columns against your uploaded "
+        "Automatically selects MATA data from Supabase table **`ygntbpro`**, pairs columns against your uploaded "
         "CBTBC (PGK) Excel file (`Presumptive` & `CI` sheets), displays discrepancies in an interactive table, "
         "and generates an Excel verification report."
     )
 
-    filter_vol_only = st.checkbox("Filter Supabase `YgnTBPro` to `VOL == 1` only", value=True)
+    filter_vol_only = st.checkbox("Filter Supabase `ygntbpro` to `VOL == 1` only", value=True)
 
     col_left, col_right = st.columns(2)
     dfmata = pd.DataFrame()
     dfpgk = pd.DataFrame()
 
     with col_left:
-        st.subheader("1️⃣ MATA Data: Supabase (`YgnTBPro`)")
+        st.subheader("1️⃣ MATA Data: Supabase (`ygntbpro`)")
         if not supabase_url or not supabase_key:
             st.warning("Please provide `SUPABASE_URL` and `SUPABASE_KEY` in the sidebar or `st.secrets`.")
         else:
             try:
-                with st.spinner("Fetching `YgnTBPro` records from Supabase..."):
-                    df_supa_raw = fetch_supabase_table(supabase_url, supabase_key, table_name="YgnTBPro")
+                with st.spinner("Fetching `ygntbpro` records from Supabase..."):
+                    df_supa_raw = fetch_supabase_table(
+                        supabase_url, supabase_key, table_name=SUPABASE_DEFAULT_TABLE
+                    )
                     dfmata = clean_mata_supabase_df(df_supa_raw, filter_vol_only=filter_vol_only)
                 st.success(
-                    f"Loaded **{len(dfmata):,}** valid rows from Supabase `YgnTBPro` "
+                    f"Loaded **{len(dfmata):,}** valid rows from Supabase `ygntbpro` "
                     f"(Total raw rows: {len(df_supa_raw):,})."
                 )
-                with st.expander("Preview Supabase `YgnTBPro` Data", expanded=False):
+                with st.expander("Preview Supabase `ygntbpro` Data", expanded=False):
                     st.dataframe(dfmata.head(50), use_container_width=True)
             except Exception as exc:
-                st.error(f"Failed to load `YgnTBPro` from Supabase: {exc}")
+                st.error(f"Failed to load `ygntbpro` from Supabase: {exc}")
 
     with col_right:
         st.subheader("2️⃣ CBTBC (PGK) Data: Upload Excel File")
@@ -1758,7 +1872,7 @@ def page_cbtbc_pgk_verification():
 
     if dfmata.empty or dfpgk.empty:
         st.info(
-            "Once both Supabase `YgnTBPro` data and the CBTBC (PGK) Excel file are loaded above, "
+            "Once both Supabase `ygntbpro` data and the CBTBC (PGK) Excel file are loaded above, "
             "configure your column pairs and view the verification results here."
         )
     else:
@@ -1768,7 +1882,7 @@ def page_cbtbc_pgk_verification():
         key_col1, key_col2, key_col3 = st.columns([2, 2, 2])
         with key_col1:
             id_col_mata = st.selectbox(
-                "🔑 Supabase (`YgnTBPro`) Primary ID Column",
+                "🔑 Supabase (`ygntbpro`) Primary ID Column",
                 options=mata_cols,
                 index=mata_cols.index("PatientID") if "PatientID" in mata_cols else 0,
             )
@@ -1811,7 +1925,7 @@ def page_cbtbc_pgk_verification():
         with st.expander("➕ Add Custom Column Pair", expanded=False):
             add_c1, add_c2, add_c3, add_c4, add_c5 = st.columns([2, 2, 2, 2, 1])
             with add_c1:
-                new_supa_col = st.selectbox("Supabase (`YgnTBPro`) Column", options=mata_cols, key="new_supa_col")
+                new_supa_col = st.selectbox("Supabase (`ygntbpro`) Column", options=mata_cols, key="new_supa_col")
             with add_c2:
                 new_pgk_col = st.selectbox(
                     "PGK Excel Column",
@@ -1855,7 +1969,7 @@ def page_cbtbc_pgk_verification():
             column_config={
                 "Enabled": st.column_config.CheckboxColumn("Check?", default=True),
                 "Supabase_Column": st.column_config.SelectboxColumn(
-                    "Supabase (YgnTBPro) Column", options=mata_cols, required=True
+                    "Supabase (ygntbpro) Column", options=mata_cols, required=True
                 ),
                 "PGK_Column": st.column_config.SelectboxColumn("PGK Excel Column", options=pgk_cols, required=True),
                 "Difference_Label": st.column_config.TextColumn("Difference Label", required=True),
@@ -1872,7 +1986,7 @@ def page_cbtbc_pgk_verification():
         st.subheader("4️⃣ CBTBC Verification Output Table & Excel Export")
         pair_records = edited_pairs_df.dropna(subset=["Supabase_Column", "PGK_Column"]).to_dict(orient="records")
 
-        with st.spinner("Comparing paired columns between Supabase `YgnTBPro` and CBTBC (PGK) Excel..."):
+        with st.spinner("Comparing paired columns between Supabase `ygntbpro` and CBTBC (PGK) Excel..."):
             df_difference = run_pairwise_verification(
                 df_mata=dfmata,
                 df_pgk=dfpgk,
@@ -1945,7 +2059,7 @@ def page_train_gender_model():
     st.title("🧠 Page 3: Train Gender Prediction Model (Supabase)")
     st.caption(
         "Manually train or re-train the gender prediction model (`TfidfVectorizer` + `NameFeatureExtractor` + `RandomForestClassifier`) "
-        "using existing data from your Supabase table (`YgnTBPro`), evaluate hold-out accuracy, and download `gender_predictor_model.pkl`."
+        "using existing data from your Supabase table **`ygntbpro`**, evaluate hold-out accuracy, and download `gender_predictor_model.pkl`."
     )
 
     if not supabase_url or not supabase_key:
@@ -1955,7 +2069,7 @@ def page_train_gender_model():
     else:
         t_col1, t_col2, t_col3 = st.columns([2, 1, 1])
         with t_col1:
-            train_table_name = st.text_input("Supabase Table for Training", value="YgnTBPro")
+            train_table_name = st.text_input("Supabase Table for Training", value=SUPABASE_DEFAULT_TABLE)
         with t_col2:
             test_size_ratio = st.slider("Test Split Ratio", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
         with t_col3:
@@ -1966,24 +2080,38 @@ def page_train_gender_model():
         try:
             with st.spinner(f"Fetching training dataset from Supabase `{train_table_name}`..."):
                 df_train_raw = fetch_supabase_table(supabase_url, supabase_key, table_name=train_table_name.strip())
+                df_train_raw = align_canonical_columns(df_train_raw)
         except Exception as exc:
             st.error(f"Failed to fetch Supabase table `{train_table_name}`: {exc}")
             df_train_raw = pd.DataFrame()
 
         if not df_train_raw.empty:
             cols_available = list(df_train_raw.columns)
+
+            # Default to Name_x or Name, and Sex_x or Sex in merged `ygntbpro` table
+            default_name_idx = (
+                cols_available.index("Name_x")
+                if "Name_x" in cols_available
+                else (cols_available.index("Name") if "Name" in cols_available else 0)
+            )
+            default_sex_idx = (
+                cols_available.index("Sex_x")
+                if "Sex_x" in cols_available
+                else (cols_available.index("Sex") if "Sex" in cols_available else 0)
+            )
+
             c_map1, c_map2, c_map3 = st.columns(3)
             with c_map1:
                 name_col_train = st.selectbox(
                     "Select Name Column",
                     options=cols_available,
-                    index=cols_available.index("Name") if "Name" in cols_available else 0,
+                    index=default_name_idx,
                 )
             with c_map2:
                 sex_col_train = st.selectbox(
                     "Select Sex / Gender Label Column",
                     options=cols_available,
-                    index=cols_available.index("Sex") if "Sex" in cols_available else 0,
+                    index=default_sex_idx,
                 )
             with c_map3:
                 dedup_names = st.checkbox("Deduplicate (Name, Sex) pairs before training", value=True)
@@ -2051,6 +2179,7 @@ def page_train_gender_model():
                             joblib.dump(pipeline, "gender_predictor_model.pkl")
                         except Exception:
                             pass
+                        gc.collect()
 
                     st.success(
                         f"Model trained and activated! Hold-out Test Accuracy: **{acc:.2%}** on {len(X_test):,} test names."
