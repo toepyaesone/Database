@@ -22,9 +22,9 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🩺 MATA (Supabase `YgnTBPro`) vs. PGK Excel Data Verification")
+st.title("🩺 MATA (Supabase `ygntbpro`) vs. PGK Excel Data Verification")
 st.caption(
-    "Automatically loads `YgnTBPro` from Supabase, pairs columns against your uploaded "
+    "Automatically loads `ygntbpro` from Supabase, pairs columns against your uploaded "
     "PGK Excel file (`Presumptive` & `CI` sheets), displays discrepancies in an interactive table, "
     "and exports the verification report to Excel."
 )
@@ -62,8 +62,8 @@ def get_default_supabase_credentials():
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_supabase_ygntbpro(supabase_url: str, supabase_key: str, table_name: str = "YgnTBPro", batch_size: int = 1000) -> pd.DataFrame:
-    """Fetch all rows from Supabase table `YgnTBPro` using pagination to bypass the 1,000-row limit."""
+def fetch_supabase_ygntbpro(supabase_url: str, supabase_key: str, table_name: str = "ygntbpro", batch_size: int = 1000) -> pd.DataFrame:
+    """Fetch all rows from Supabase table `ygntbpro` using pagination to bypass the 1,000-row limit."""
     from supabase import create_client
 
     if not supabase_url or not supabase_key:
@@ -378,13 +378,13 @@ def generate_excel_bytes(df_diff: pd.DataFrame, sheet_name: str = "CheckData") -
 
 
 # ==============================================================================
-# 4. SIDEBAR: SUPABASE CONNECTION (`YgnTBPro` AUTOMATICALLY SELECTED)
+# 4. SIDEBAR: SUPABASE CONNECTION (`ygntbpro` AUTOMATICALLY SELECTED)
 # ==============================================================================
 default_url, default_key = get_default_supabase_credentials()
 
 with st.sidebar:
     st.header("🗄️ Supabase Connection")
-    st.info("MATA data is automatically fetched from Supabase table **`YgnTBPro`**.")
+    st.info("MATA data is automatically fetched from Supabase table **`ygntbpro`**.")
 
     supabase_url = st.text_input(
         "Supabase URL",
@@ -399,7 +399,7 @@ with st.sidebar:
         placeholder="Enter Supabase anon / service_role key",
         help="Loaded automatically from st.secrets['SUPABASE_KEY'] or environment variable SUPABASE_KEY."
     )
-    table_name = "YgnTBPro"
+    table_name = "ygntbpro"
     st.text_input("Supabase Table", value=table_name, disabled=True)
 
     filter_vol_only = st.checkbox("Filter `VOL == 1` only", value=True)
@@ -410,7 +410,7 @@ with st.sidebar:
 
 
 # ==============================================================================
-# 5. STEP 1 & 2: LOAD SUPABASE `YgnTBPro` & UPLOAD PGK EXCEL FILE
+# 5. STEP 1 & 2: LOAD SUPABASE `ygntbpro` & UPLOAD PGK EXCEL FILE
 # ==============================================================================
 col_left, col_right = st.columns(2)
 
@@ -418,7 +418,7 @@ dfmata = pd.DataFrame()
 dfpgk = pd.DataFrame()
 
 with col_left:
-    st.subheader("1️⃣ MATA Data: Supabase (`YgnTBPro`)")
+    st.subheader("1️⃣ MATA Data: Supabase (`ygntbpro`)")
     if not supabase_url or not supabase_key:
         st.warning(
             "Please provide `SUPABASE_URL` and `SUPABASE_KEY` in `.streamlit/secrets.toml`, "
@@ -426,17 +426,17 @@ with col_left:
         )
     else:
         try:
-            with st.spinner("Fetching `YgnTBPro` records from Supabase..."):
-                df_supa_raw = fetch_supabase_ygntbpro(supabase_url, supabase_key, table_name="YgnTBPro")
+            with st.spinner("Fetching `ygntbpro` records from Supabase..."):
+                df_supa_raw = fetch_supabase_ygntbpro(supabase_url, supabase_key, table_name="ygntbpro")
                 dfmata = clean_mata_supabase_df(df_supa_raw, filter_vol_only=filter_vol_only)
             st.success(
-                f"Loaded **{len(dfmata):,}** valid rows from Supabase `YgnTBPro` "
+                f"Loaded **{len(dfmata):,}** valid rows from Supabase `ygntbpro` "
                 f"(Total raw rows fetched: {len(df_supa_raw):,})."
             )
             with st.expander("Preview Supabase `YgnTBPro` Data", expanded=False):
                 st.dataframe(dfmata.head(50), use_container_width=True)
         except Exception as exc:
-            st.error(f"Failed to load `YgnTBPro` from Supabase: {exc}")
+            st.error(f"Failed to load `ygntbpro` from Supabase: {exc}")
 
 with col_right:
     st.subheader("2️⃣ PGK Data: Upload Excel File")
@@ -461,7 +461,7 @@ with col_right:
 st.subheader("3️⃣ Pair-Wise Column Mapping for Data Checking")
 
 if dfmata.empty or dfpgk.empty:
-    st.info("Once both Supabase `YgnTBPro` data and the PGK Excel file are loaded above, configure your column pairs and view the verification results here.")
+    st.info("Once both Supabase `ygntbpro` data and the PGK Excel file are loaded above, configure your column pairs and view the verification results here.")
 else:
     mata_cols = list(dfmata.columns)
     pgk_cols = list(dfpgk.columns)
@@ -470,7 +470,7 @@ else:
     key_col1, key_col2, key_col3 = st.columns([2, 2, 2])
     with key_col1:
         id_col_mata = st.selectbox(
-            "🔑 Supabase (`YgnTBPro`) Primary ID Column",
+            "🔑 Supabase (`ygntbpro`) Primary ID Column",
             options=mata_cols,
             index=mata_cols.index("PatientID") if "PatientID" in mata_cols else 0
         )
@@ -521,7 +521,7 @@ else:
     with st.expander("➕ Add Custom Column Pair", expanded=False):
         add_c1, add_c2, add_c3, add_c4, add_c5 = st.columns([2, 2, 2, 2, 1])
         with add_c1:
-            new_supa_col = st.selectbox("Supabase (`YgnTBPro`) Column", options=mata_cols, key="new_supa_col")
+            new_supa_col = st.selectbox("Supabase (`ygntbpro`) Column", options=mata_cols, key="new_supa_col")
         with add_c2:
             new_pgk_col = st.selectbox(
                 "PGK Excel Column",
@@ -567,8 +567,8 @@ else:
                 default=True
             ),
             "Supabase_Column": st.column_config.SelectboxColumn(
-                "Supabase (YgnTBPro) Column",
-                help="Column from Supabase table YgnTBPro",
+                "Supabase (ygntbpro) Column",
+                help="Column from Supabase table ygntbpro",
                 options=mata_cols,
                 required=True
             ),
@@ -601,7 +601,7 @@ else:
 
     pair_records = edited_pairs_df.dropna(subset=["Supabase_Column", "PGK_Column"]).to_dict(orient="records")
 
-    with st.spinner("Comparing paired columns between Supabase `YgnTBPro` and PGK Excel..."):
+    with st.spinner("Comparing paired columns between Supabase `ygntbpro` and PGK Excel..."):
         df_difference = run_pairwise_verification(
             df_mata=dfmata,
             df_pgk=dfpgk,
