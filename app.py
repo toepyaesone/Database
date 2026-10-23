@@ -316,11 +316,14 @@ def run_gender_prediction_check(
         return pd.DataFrame(columns=["PatientID", "name", "gender", "predicted_gender", "confidence"])
 
     df_gender = pd.DataFrame()
-    df_gender["PatientID"] = df_source[actual_id_col].astype(str) if actual_id_col else ""
-    df_gender["name"] = df_source[actual_name_col].fillna("").astype(str).str.strip()
+    df_gender["PatientID"] = (
+        df_source[actual_id_col].astype("string").fillna("") if actual_id_col else ""
+    )
+    df_gender["name"] = df_source[actual_name_col].astype("string").fillna("").str.strip()
     df_gender["gender"] = (
         df_source[actual_sex_col]
-        .astype(str)
+        .astype("string")
+        .fillna("")
         .str.strip()
         .replace({"1": "M", "2": "F", "1.0": "M", "2.0": "F", "Male": "M", "Female": "F"})
     )
@@ -331,8 +334,10 @@ def run_gender_prediction_check(
     if df_predict.empty:
         return pd.DataFrame(columns=["PatientID", "name", "gender", "predicted_gender", "confidence"])
 
-    predictions = model.predict(df_predict["name"])
-    probabilities = model.predict_proba(df_predict["name"])
+    # Convert to plain Python list[str] so PyArrow ChunkedArray is never passed into scikit-learn
+    name_inputs = [str(v) for v in df_predict["name"].tolist()]
+    predictions = model.predict(name_inputs)
+    probabilities = model.predict_proba(name_inputs)
     df_predict["predicted_gender"] = predictions
     df_predict["confidence"] = np.max(probabilities, axis=1).round(4)
 
@@ -630,7 +635,7 @@ def prepare_combined_dataframe(ygntbpro_df: pd.DataFrame, tb_df: pd.DataFrame | 
             if col in df_combined.columns:
                 df_combined[col] = (
                     df_combined[col]
-                    .astype(str)
+                    .astype("string")
                     .str.replace(r"\.0$", "", regex=True)
                     .replace({"nan": pd.NA, "<NA>": pd.NA, "None": pd.NA})
                 )
@@ -740,7 +745,7 @@ class TBDataValidator:
                     if not (start_date <= visit_date <= end_date):
                         self.add_error(
                             row,
-                            f"Date {visit_date.date()} is out of PPM date range ({start_date.date()} to {end_date.date()})",
+                            f"Date {visit_date.date()} is out of range ({start_date.date()} to {end_date.date()})",
                         )
                 else:
                     self.add_error(row, f"Invalid Month: {visit_no}")
@@ -752,7 +757,7 @@ class TBDataValidator:
                 if not pd.isna(last_date):
                     date_diff = abs((visit_date - last_date).days)
                     if date_diff > 30:
-                        self.add_error(row, f"check Date and Visit No : {visit_no} has {date_diff} days difference from last visit date {last_date.date()}")
+                        self.add_error(row, f"check Date or Visit No: {visit_no} has {date_diff} days difference from last visit date {last_date.date()}")
             else:
                 self.visit_log[visit_no] = visit_date
 
@@ -906,14 +911,10 @@ class TBDataValidator:
             if is_reg_no and not self.is_missing(regime):
                 self.add_error(row, f"check_regime: Treatment Registration is No but found regime {regime}")
             if self.is_equal(tbcase, 1):
-                if is_reg_yes or self.is_missing(regime):
-                    self.add_error(
-                        row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}"
-                    )
+                if is_reg_yes and self.is_missing(regime):
+                    self.add_error(row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}")
                 elif is_reg_no and not self.is_missing(regime):
-                    self.add_error(
-                        row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}"
-                    )
+                    self.add_error(row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}")
 
     def check_completeness(self, row):
         tbcase = row.get("Case")
@@ -1167,7 +1168,13 @@ def fuzzyMatchingData(dfmata: pd.DataFrame, score_threshold: int = 85, chunk_siz
 
     df_sub = df_sub.reset_index(drop=True)
     for c in columns_to_check:
-        df_sub[c] = df_sub[c].fillna("").astype(str).str.strip()
+        df_sub[c] = (
+            df_sub[c]
+            .astype("string")
+            .fillna("")
+            .str.replace(r"\.0$", "", regex=True)
+            .str.strip()
+        )
 
     df_sub["DataCheck"] = (
         df_sub["Name_x"]
@@ -1182,15 +1189,15 @@ def fuzzyMatchingData(dfmata: pd.DataFrame, score_threshold: int = 85, chunk_siz
     )
     df_sub["Visit_no_int"] = pd.to_numeric(df_sub["Visit_no"], errors="coerce").fillna(0).astype(int)
 
-    datacheck_values = df_sub["DataCheck"].tolist()
-    pids = df_sub["PatientID"].astype(str).tolist()
-    addresses = df_sub["Address_x"].fillna("").astype(str).tolist()
-    visits = df_sub["Visit_no_int"].tolist()
-    names = df_sub["Name_x"].tolist()
-    ages = df_sub["Age_x"].tolist()
-    sexes = df_sub["Sex_x"].tolist()
-    tsps = df_sub["Tsp"].tolist()
-    rfes = df_sub["Reasonforexamination"].tolist()
+    datacheck_values = [str(v) for v in df_sub["DataCheck"].tolist()]
+    pids = [str(v) for v in df_sub["PatientID"].astype("string").fillna("").tolist()]
+    addresses = [str(v) for v in df_sub["Address_x"].astype("string").fillna("").tolist()]
+    visits = [int(v) for v in df_sub["Visit_no_int"].tolist()]
+    names = [str(v) for v in df_sub["Name_x"].tolist()]
+    ages = [str(v) for v in df_sub["Age_x"].tolist()]
+    sexes = [str(v) for v in df_sub["Sex_x"].tolist()]
+    tsps = [str(v) for v in df_sub["Tsp"].tolist()]
+    rfes = [str(v) for v in df_sub["Reasonforexamination"].tolist()]
 
     results = []
 
@@ -2378,12 +2385,12 @@ def page_train_gender_model():
             with c_map3:
                 dedup_names = st.checkbox("Deduplicate (Name, Sex) pairs before training", value=True)
 
-            df_prep = df_train_raw[[name_col_train, sex_col_train]].copy()
-            df_prep.columns = ["name", "gender"]
-            df_prep["name"] = df_prep["name"].fillna("").astype(str).str.strip()
+            df_prep = pd.DataFrame()
+            df_prep["name"] = df_train_raw[name_col_train].astype("string").fillna("").str.strip()
             df_prep["gender"] = (
-                df_prep["gender"]
-                .astype(str)
+                df_train_raw[sex_col_train]
+                .astype("string")
+                .fillna("")
                 .str.strip()
                 .replace({"1": "M", "2": "F", "1.0": "M", "2.0": "F", "Male": "M", "Female": "F", "m": "M", "f": "F"})
             )
@@ -2409,8 +2416,10 @@ def page_train_gender_model():
                     st.error("Insufficient labeled `M` / `F` records to train a reliable model.")
                 else:
                     with st.spinner("Training TF-IDF + NameFeatureExtractor + RandomForest pipeline..."):
-                        X = df_prep["name"].values
-                        y = df_prep["gender"].values
+                        # Convert PyArrow/Pandas string Series into pure 1D NumPy object arrays
+                        # (avoids Pandas 3/4 pyarrow.lib.ChunkedArray.__getitem__ TypeError in train_test_split)
+                        X = np.asarray([str(v) for v in df_prep["name"].tolist()], dtype=object)
+                        y = np.asarray([str(v) for v in df_prep["gender"].tolist()], dtype=object)
 
                         X_train, X_test, y_train, y_test = train_test_split(
                             X, y, test_size=float(test_size_ratio), random_state=42, stratify=y
