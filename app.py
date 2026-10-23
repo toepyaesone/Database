@@ -2,10 +2,11 @@ import os
 import re
 import gc
 import difflib
+import tempfile
 import warnings
 from io import BytesIO
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 
 import joblib
 import numpy as np
@@ -29,15 +30,108 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. PAGE CONFIGURATION
+# 1. CROSS-PLATFORM CONFIGURATION (WINDOWS, MACOS, IPAD, IPHONE)
 # ==============================================================================
 st.set_page_config(
     page_title="MATA TB Data Verification Suite (PPM & CBTBC)",
     page_icon="🩺",
     layout="wide",
+    initial_sidebar_state="auto",
 )
 
 SUPABASE_DEFAULT_TABLE = "ygntbpro"
+APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+
+# Cross-platform month abbreviations (independent of OS C-locale on Windows/macOS/iOS)
+MONTH_ABBR = {
+    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
+}
+
+# Epoch-zero placeholder dates across Unix (1970), Windows Excel (1899/1900), and macOS Excel (1904)
+EPOCH_ZERO_DATES = {
+    date(1970, 1, 1),
+    date(1899, 12, 30),
+    date(1899, 12, 31),
+    date(1900, 1, 1),
+    date(1904, 1, 1),
+}
+
+INVALID_DATE_TOKENS = {
+    "", "0", "0.0", "nan", "nat", "none", "<na>", "null", "nil", "n/a", "na", "-", "--",
+    "1970-01-01", "1970-01-01 00:00:00", "01-jan-1970", "1900-01-00", "1900-01-01",
+    "1899-12-30", "1904-01-01", "00/00/0000", "00-00-0000",
+}
+
+
+def parse_valid_datetime(val) -> pd.Timestamp | type(pd.NaT):
+    """
+    Cross-platform safe datetime parser (Windows, macOS, Linux, iPadOS, iOS).
+    Returns `pd.NaT` for blank values, numeric zeros (`0`/`0.0`), unparseable strings,
+    and epoch-zero artifacts (`01-Jan-1970`, `1899-12-30`, `1900-01-01`, `1904-01-01`).
+    """
+    if val is None or pd.isna(val):
+        return pd.NaT
+
+    # Prevent raw numbers (like 0 or 0.0) from being parsed as nanoseconds since 01-Jan-1970
+    if isinstance(val, (int, float, np.number, bool)):
+        return pd.NaT
+
+    if isinstance(val, (pd.Timestamp, datetime, date)):
+        dt_val = pd.Timestamp(val)
+        if pd.isna(dt_val) or dt_val.date() in EPOCH_ZERO_DATES or dt_val.year <= 1970:
+            return pd.NaT
+        return dt_val
+
+    s = str(val).strip()
+    if not s or s.lower() in INVALID_DATE_TOKENS:
+        return pd.NaT
+
+    # Reject purely numeric strings (e.g. "0", "0.0", "123") so they never become 1970-01-01
+    try:
+        float(s)
+        return pd.NaT
+    except ValueError:
+        pass
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dt = pd.to_datetime(s, errors="coerce")
+
+    if pd.isna(dt) or dt.date() in EPOCH_ZERO_DATES or dt.year <= 1970:
+        return pd.NaT
+    return dt
+
+
+def clean_datetime_series(series: pd.Series) -> pd.Series:
+    """
+    Vectorized, cross-platform datetime cleaner for DataFrame columns.
+    Masks blanks, numeric zeros, and 1970/1900/1904 epoch placeholders to `pd.NaT`.
+    """
+    if series is None or series.empty:
+        return pd.to_datetime(series, errors="coerce")
+
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+
+    s_str = series.astype("string").str.strip()
+    lower_mask = s_str.str.lower().isin(INVALID_DATE_TOKENS)
+    numeric_mask = pd.to_numeric(s_str, errors="coerce").notna()
+    s_clean = s_str.mask(lower_mask | numeric_mask, pd.NA)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dt_series = pd.to_datetime(s_clean, errors="coerce")
+
+    epoch_mask = dt_series.dt.date.isin(EPOCH_ZERO_DATES) | (dt_series.dt.year <= 1970)
+    return dt_series.mask(epoch_mask, pd.NaT)
+
+
+def format_date_cross_platform(dt_obj: pd.Timestamp) -> str:
+    """Format a Timestamp as DD-Mmm-YYYY identically across Windows, macOS, iPad, and iPhone."""
+    if pd.isna(dt_obj):
+        return "Missing"
+    return f"{dt_obj.day:02d}-{MONTH_ABBR.get(dt_obj.month, 'Jan')}-{dt_obj.year}"
 
 
 # ==============================================================================
@@ -83,7 +177,11 @@ class NameFeatureExtractor(BaseEstimator, TransformerMixin):
     @staticmethod
     def predict_gender(name, model=None, model_file="gender_predictor_model.pkl"):
         if model is None:
-            model = joblib.load(model_file)
+            model_path = Path(model_file)
+            if not model_path.is_absolute():
+                candidate = APP_DIR / model_path
+                model_path = candidate if candidate.exists() else model_path
+            model = joblib.load(model_path)
         prediction = model.predict([str(name)])[0]
         probability = model.predict_proba([str(name)])[0]
         return prediction, float(max(probability))
@@ -405,12 +503,12 @@ def align_canonical_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def changeDtype(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert DataFrame columns to their standardized nullable types."""
+    """Convert DataFrame columns to their standardized nullable types safely across platforms."""
     df_out = df.copy()
     for col, dtype in DTYPE_CHANGE_MAP.items():
         if col in df_out.columns:
             if dtype.startswith("datetime64"):
-                df_out[col] = pd.to_datetime(df_out[col].replace("", np.nan), errors="coerce")
+                df_out[col] = clean_datetime_series(df_out[col])
             elif dtype == "Int64":
                 df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype("Int64")
             elif dtype == "float32":
@@ -503,9 +601,9 @@ class TBDataValidator:
 
     @staticmethod
     def is_missing(data) -> bool:
-        if pd.isna(data):
+        if data is None or pd.isna(data):
             return True
-        if str(data).strip().lower() in ("", "nan", "none", "<na>", "nat"):
+        if str(data).strip().lower() in INVALID_DATE_TOKENS:
             return True
         return False
 
@@ -534,10 +632,12 @@ class TBDataValidator:
     def check_year_consistency(self, row):
         for col in self.date_columns_to_check:
             date_val = row.get(col)
-            if not self.is_missing(date_val):
-                dt_obj = pd.to_datetime(date_val, errors="coerce")
-                if not pd.isna(dt_obj) and dt_obj.year != self.target_year:
-                    self.add_error(row, f"checkYear in {col}: Year is {dt_obj.strftime('%d-%b-%Y')}")
+            dt_obj = parse_valid_datetime(date_val)
+            if not pd.isna(dt_obj) and dt_obj.year != self.target_year:
+                self.add_error(
+                    row,
+                    f"checkYear in {col}: Year is {format_date_cross_platform(dt_obj)}",
+                )
 
     def check_date(self, row):
         date_field = row.get("Date_x")
@@ -547,7 +647,7 @@ class TBDataValidator:
         if self.is_missing(date_field) or self.is_missing(visit_no) or self.is_missing(approach):
             return
 
-        visit_date = pd.to_datetime(date_field, errors="coerce")
+        visit_date = parse_valid_datetime(date_field)
         if pd.isna(visit_date):
             return
 
@@ -565,7 +665,7 @@ class TBDataValidator:
                     if not (start_date <= visit_date <= end_date):
                         self.add_error(
                             row,
-                            f"Date {visit_date.date()} outside PPM range ({start_date.date()} to {end_date.date()})",
+                            f"Date {visit_date.date()} outside PPM date range ({start_date.date()} to {end_date.date()})",
                         )
                 else:
                     self.add_error(row, f"Invalid Month: {visit_no}")
@@ -573,10 +673,11 @@ class TBDataValidator:
                 pass
         else:
             if visit_no in self.visit_log:
-                last_date = pd.to_datetime(self.visit_log[visit_no])
-                date_diff = abs((visit_date - last_date).days)
-                if date_diff > 30:
-                    self.add_error(row, f"Visit {visit_no} discrepancy: {date_diff} days difference")
+                last_date = parse_valid_datetime(self.visit_log[visit_no])
+                if not pd.isna(last_date):
+                    date_diff = abs((visit_date - last_date).days)
+                    if date_diff > 30:
+                        self.add_error(row, f"check Date or Visit {visit_no} with discrepancy: {date_diff} days difference from last recorded date {last_date.date()}")
             else:
                 self.visit_log[visit_no] = visit_date
 
@@ -592,7 +693,7 @@ class TBDataValidator:
             self.seen_pids.add(pid)
 
         raw_date = row.get("Date_x")
-        dt_parsed = pd.to_datetime(raw_date, errors="coerce") if not self.is_missing(raw_date) else pd.NaT
+        dt_parsed = parse_valid_datetime(raw_date)
 
         if (
             self.is_missing(row.get("Visit_no"))
@@ -620,7 +721,7 @@ class TBDataValidator:
         raw_sr = row.get("Sr_No")
         sr = str(int(float(raw_sr))).zfill(4) if not self.is_missing(raw_sr) else ""
 
-        yr = dt_parsed.strftime("%y") if not pd.isna(dt_parsed) else ""
+        yr = f"{dt_parsed.year % 100:02d}" if not pd.isna(dt_parsed) else ""
 
         if self.is_equal(team, "5") and team != pid[0]:
             self.add_error(row, f"check_PatientID: Organization {pid[0]} mismatch with Team {team}")
@@ -729,10 +830,15 @@ class TBDataValidator:
                 self.add_error(row, "check_regime: Treatment Registration is Yes but missing regime")
             if is_reg_no and not self.is_missing(regime):
                 self.add_error(row, f"check_regime: Treatment Registration is No but found regime {regime}")
-            if self.is_equal(tbcase, 1) and (not is_reg_yes or self.is_missing(regime)):
-                self.add_error(
-                    row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}"
-                )
+            if self.is_equal(tbcase, 1):
+                if is_reg_yes and self.is_missing(regime):
+                    self.add_error(
+                        row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}"
+                    )
+                elif is_reg_no and not self.is_missing(regime):
+                    self.add_error(
+                        row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}"
+                    )
 
     def check_completeness(self, row):
         tbcase = row.get("Case")
@@ -849,14 +955,15 @@ class TBDataValidator:
                 )
 
     def check_outcome(self, row):
-        if self.is_missing(row.get("Treatment Outcome")):
-            if not self.is_missing(row.get("Treatment Outcome date")):
+        outcome_raw = row.get("Treatment Outcome")
+        outcome_dt = parse_valid_datetime(row.get("Treatment Outcome date"))
+        if self.is_missing(outcome_raw):
+            if not pd.isna(outcome_dt):
                 self.add_error(row, "check_outcome: Missing Treatment Outcome but found date")
         else:
-            outcome = str(row.get("Treatment Outcome")).strip().lower()
-            outcome_date = row.get("Treatment Outcome date")
+            outcome = str(outcome_raw).strip().lower()
             bact = row.get("Bacteriological status")
-            if self.is_missing(outcome_date):
+            if pd.isna(outcome_dt):
                 self.add_error(row, "check_outcome date: Missing Outcome date but found Outcome")
             if self.is_equal(outcome, "c") and not self.is_equal(bact, "BC"):
                 self.add_error(row, f"check_outcome: Outcome {outcome} but not BC status")
@@ -1220,9 +1327,9 @@ def compare_data(
 
     for col in date_cols:
         if col in dfC.columns:
-            dfC[col] = pd.to_datetime(dfC[col], errors="coerce").dt.strftime("%Y-%m-%d")
+            dfC[col] = clean_datetime_series(dfC[col]).dt.strftime("%Y-%m-%d")
         if col in dfP.columns:
-            dfP[col] = pd.to_datetime(dfP[col], errors="coerce").dt.strftime("%Y-%m-%d")
+            dfP[col] = clean_datetime_series(dfP[col]).dt.strftime("%Y-%m-%d")
 
     records = []
     ids_current = set(dfC[id_col].dropna().unique()) - {"", "nan", "None", "<NA>"}
@@ -1555,14 +1662,29 @@ def run_pairwise_verification(
 # ==============================================================================
 @st.cache_resource(show_spinner=False)
 def load_default_gender_model():
-    """Load `gender_predictor_model.pkl` once across sessions if present in repository."""
-    default_model_path = Path("gender_predictor_model.pkl")
-    if default_model_path.exists():
-        try:
-            return joblib.load(default_model_path)
-        except Exception:
-            return None
+    """Load `gender_predictor_model.pkl` once across sessions using cross-platform Path resolution."""
+    candidates = [
+        APP_DIR / "gender_predictor_model.pkl",
+        Path.cwd() / "gender_predictor_model.pkl",
+        Path(tempfile.gettempdir()) / "gender_predictor_model.pkl",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                return joblib.load(path)
+            except Exception:
+                continue
     return None
+
+
+def save_gender_model_cross_platform(pipeline) -> None:
+    """Save trained model to app directory or OS temp directory (works on Windows, macOS, Linux, iOS)."""
+    for target in [APP_DIR / "gender_predictor_model.pkl", Path(tempfile.gettempdir()) / "gender_predictor_model.pkl"]:
+        try:
+            joblib.dump(pipeline, target)
+            return
+        except Exception:
+            continue
 
 
 if "gender_model" not in st.session_state:
@@ -2231,10 +2353,7 @@ def page_train_gender_model():
                             .rename(columns={"index": "Class / Metric"}),
                             "samples": len(df_prep),
                         }
-                        try:
-                            joblib.dump(pipeline, "gender_predictor_model.pkl")
-                        except Exception:
-                            pass
+                        save_gender_model_cross_platform(pipeline)
                         gc.collect()
 
                     st.success(
