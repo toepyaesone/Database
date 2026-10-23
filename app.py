@@ -1535,7 +1535,7 @@ def page_ppm_database_verification():
     if verification_source == "Existing Supabase Data (YgnTBPro)":
         supa_c1, supa_c2 = st.columns(2)
         with supa_c1:
-            supa_ygn_table = st.text_input("Supabase Main Table Name", value="YgnTBPro")
+            supa_ygn_table = st.text_input("Supabase Main Table Name", value="ygntbpro", placeholder="e.g., ygntbpro")
         with supa_c2:
             supa_tb_table = st.text_input(
                 "Optional Supabase Notified TB Register Table (leave blank if standalone YgnTBPro)",
