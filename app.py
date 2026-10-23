@@ -175,8 +175,8 @@ def run_gender_prediction_check(
 # ==============================================================================
 def get_default_supabase_credentials():
     """Retrieve Supabase URL and Key from Streamlit secrets or environment variables."""
-    url = ""
-    key = ""
+    url = "https://kocihpxevlowqbguhstf.supabase.co"
+    key = "sb_publishable_JtrNLjMNSvZ5LzvXKbv2xw_mj-hl5MD"
     try:
         if "SUPABASE_URL" in st.secrets:
             url = st.secrets["SUPABASE_URL"]
@@ -200,7 +200,7 @@ def get_default_supabase_credentials():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_supabase_table(
-    supabase_url: str, supabase_key: str, table_name: str = "YgnTBPro", batch_size: int = 1000
+    supabase_url: str, supabase_key: str, table_name: str = "ygntbpro", batch_size: int = 1000
 ) -> pd.DataFrame:
     """Fetch all rows from a Supabase table using pagination to bypass the 1,000-row limit."""
     from supabase import create_client
@@ -1476,7 +1476,7 @@ with st.sidebar:
     supabase_url = st.text_input(
         "Supabase URL",
         value=default_url,
-        placeholder="https://your-project.supabase.co",
+        placeholder="https://kocihpxevlowqbguhstf.supabase.co",
     )
     supabase_key = st.text_input(
         "Supabase Key",
