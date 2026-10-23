@@ -1,6 +1,7 @@
 import os
 import re
 import gc
+import sys
 import difflib
 import tempfile
 import warnings
@@ -135,9 +136,9 @@ def format_date_cross_platform(dt_obj: pd.Timestamp) -> str:
 
 
 # ==============================================================================
-# 2. GENDER PREDICTION FEATURE EXTRACTOR (TOP-LEVEL FOR PICKLE COMPATIBILITY)
+# 2. GENDER PREDICTION FEATURE EXTRACTOR (SINGLETON PICKLE-SAFE ACROSS RERUNS)
 # ==============================================================================
-def extract_features(name):
+def _extract_features_impl(name):
     """Extract character and token level features from a person's name."""
     name_str = "" if pd.isna(name) else str(name).strip().lower()
     words = name_str.split()
@@ -152,7 +153,18 @@ def extract_features(name):
     }
 
 
-class NameFeatureExtractor(BaseEstimator, TransformerMixin):
+_extract_features_impl.__name__ = "extract_features"
+_extract_features_impl.__qualname__ = "extract_features"
+_extract_features_impl.__module__ = "__main__"
+
+if hasattr(sys, "_mata_extract_features"):
+    extract_features = sys._mata_extract_features
+else:
+    extract_features = _extract_features_impl
+    sys._mata_extract_features = extract_features
+
+
+class _NameFeatureExtractorImpl(BaseEstimator, TransformerMixin):
     """Scikit-learn compatible transformer for custom name features."""
 
     def fit(self, X, y=None):
@@ -185,6 +197,64 @@ class NameFeatureExtractor(BaseEstimator, TransformerMixin):
         prediction = model.predict([str(name)])[0]
         probability = model.predict_proba([str(name)])[0]
         return prediction, float(max(probability))
+
+
+_NameFeatureExtractorImpl.__name__ = "NameFeatureExtractor"
+_NameFeatureExtractorImpl.__qualname__ = "NameFeatureExtractor"
+_NameFeatureExtractorImpl.__module__ = "__main__"
+
+# Preserve the exact same class object across Streamlit reruns so pickle/joblib
+# never raises: PicklingError: Can't pickle <class '__main__.NameFeatureExtractor'>:
+# it's not the same object as __main__.NameFeatureExtractor
+if hasattr(sys, "_mata_NameFeatureExtractor"):
+    NameFeatureExtractor = sys._mata_NameFeatureExtractor
+else:
+    NameFeatureExtractor = _NameFeatureExtractorImpl
+    sys._mata_NameFeatureExtractor = NameFeatureExtractor
+
+if "__main__" in sys.modules:
+    setattr(sys.modules["__main__"], "NameFeatureExtractor", NameFeatureExtractor)
+    setattr(sys.modules["__main__"], "extract_features", extract_features)
+setattr(sys.modules[__name__], "NameFeatureExtractor", NameFeatureExtractor)
+setattr(sys.modules[__name__], "extract_features", extract_features)
+
+
+def ensure_picklable_gender_model(model):
+    """
+    Synchronize any `NameFeatureExtractor` instance inside a loaded or cached Pipeline
+    with the current module's singleton `NameFeatureExtractor` class before `joblib.dump`.
+    """
+    if model is None:
+        return None
+
+    if "__main__" in sys.modules:
+        setattr(sys.modules["__main__"], "NameFeatureExtractor", NameFeatureExtractor)
+        setattr(sys.modules["__main__"], "extract_features", extract_features)
+    setattr(sys.modules[__name__], "NameFeatureExtractor", NameFeatureExtractor)
+    setattr(sys.modules[__name__], "extract_features", extract_features)
+
+    def _rebind_obj(obj):
+        if obj is None:
+            return
+        if type(obj).__name__ == "NameFeatureExtractor" and type(obj) is not NameFeatureExtractor:
+            obj.__class__ = NameFeatureExtractor
+        if isinstance(obj, Pipeline):
+            for _, step in obj.steps:
+                _rebind_obj(step)
+        elif isinstance(obj, FeatureUnion):
+            for _, trans in obj.transformer_list:
+                _rebind_obj(trans)
+
+    _rebind_obj(model)
+    return model
+
+
+def serialize_gender_model(model) -> bytes:
+    """Safely serialize a trained or loaded gender prediction pipeline to bytes."""
+    ensure_picklable_gender_model(model)
+    buf = BytesIO()
+    joblib.dump(model, buf)
+    return buf.getvalue()
 
 
 def build_gender_pipeline(n_estimators: int = 200, random_state: int = 42) -> Pipeline:
@@ -630,6 +700,11 @@ class TBDataValidator:
         )
 
     def check_year_consistency(self, row):
+        """
+        Check that all populated, valid dates match `self.target_year`.
+        Skips blanks, invalid date formats, numeric zeros (`0`/`0.0`), and epoch-zero
+        placeholders (`01-Jan-1970`, `1899-12-30`, `1900-01-01`, `1904-01-01`).
+        """
         for col in self.date_columns_to_check:
             date_val = row.get(col)
             dt_obj = parse_valid_datetime(date_val)
@@ -665,7 +740,7 @@ class TBDataValidator:
                     if not (start_date <= visit_date <= end_date):
                         self.add_error(
                             row,
-                            f"Date {visit_date.date()} outside PPM date range ({start_date.date()} to {end_date.date()})",
+                            f"Date {visit_date.date()} is out of PPM date range ({start_date.date()} to {end_date.date()})",
                         )
                 else:
                     self.add_error(row, f"Invalid Month: {visit_no}")
@@ -677,7 +752,7 @@ class TBDataValidator:
                 if not pd.isna(last_date):
                     date_diff = abs((visit_date - last_date).days)
                     if date_diff > 30:
-                        self.add_error(row, f"check Date or Visit {visit_no} with discrepancy: {date_diff} days difference from last recorded date {last_date.date()}")
+                        self.add_error(row, f"check Date and Visit No : {visit_no} has {date_diff} days difference from last visit date {last_date.date()}")
             else:
                 self.visit_log[visit_no] = visit_date
 
@@ -831,7 +906,7 @@ class TBDataValidator:
             if is_reg_no and not self.is_missing(regime):
                 self.add_error(row, f"check_regime: Treatment Registration is No but found regime {regime}")
             if self.is_equal(tbcase, 1):
-                if is_reg_yes and self.is_missing(regime):
+                if is_reg_yes or self.is_missing(regime):
                     self.add_error(
                         row, f"check_regime: TB Case is 1 but Treatment Registration is {reg} and regime is {regime}"
                     )
@@ -1671,7 +1746,8 @@ def load_default_gender_model():
     for path in candidates:
         if path.exists():
             try:
-                return joblib.load(path)
+                loaded_model = joblib.load(path)
+                return ensure_picklable_gender_model(loaded_model)
             except Exception:
                 continue
     return None
@@ -1679,6 +1755,7 @@ def load_default_gender_model():
 
 def save_gender_model_cross_platform(pipeline) -> None:
     """Save trained model to app directory or OS temp directory (works on Windows, macOS, Linux, iOS)."""
+    ensure_picklable_gender_model(pipeline)
     for target in [APP_DIR / "gender_predictor_model.pkl", Path(tempfile.gettempdir()) / "gender_predictor_model.pkl"]:
         try:
             joblib.dump(pipeline, target)
@@ -1690,6 +1767,9 @@ def save_gender_model_cross_platform(pipeline) -> None:
 if "gender_model" not in st.session_state:
     cached_model = load_default_gender_model()
     st.session_state["gender_model"] = cached_model
+    st.session_state["gender_model_bytes"] = (
+        serialize_gender_model(cached_model) if cached_model is not None else None
+    )
     st.session_state["gender_model_source"] = (
         "Loaded from gender_predictor_model.pkl" if cached_model is not None else "Not loaded"
     )
@@ -1725,7 +1805,11 @@ with st.sidebar:
     )
     if uploaded_model_pkl is not None:
         try:
-            st.session_state["gender_model"] = joblib.load(BytesIO(uploaded_model_pkl.getvalue()))
+            raw_pkl_bytes = uploaded_model_pkl.getvalue()
+            loaded_model = joblib.load(BytesIO(raw_pkl_bytes))
+            ensure_picklable_gender_model(loaded_model)
+            st.session_state["gender_model"] = loaded_model
+            st.session_state["gender_model_bytes"] = raw_pkl_bytes
             st.session_state["gender_model_source"] = f"Uploaded ({uploaded_model_pkl.name})"
             st.success("Loaded uploaded gender model!")
         except Exception as exc:
@@ -2342,7 +2426,9 @@ def page_train_gender_model():
                         # Refit on 100% of clean labeled data for production use
                         pipeline.fit(X, y)
 
+                        serialized_bytes = serialize_gender_model(pipeline)
                         st.session_state["gender_model"] = pipeline
+                        st.session_state["gender_model_bytes"] = serialized_bytes
                         st.session_state["gender_model_source"] = (
                             f"Trained on Supabase `{train_table_name}` ({len(df_prep):,} samples, Acc={acc:.2%})"
                         )
@@ -2368,14 +2454,16 @@ def page_train_gender_model():
 
             if st.session_state.get("gender_model") is not None:
                 st.subheader("💾 Download & Test Active Gender Model")
-                model_buf = BytesIO()
-                joblib.dump(st.session_state["gender_model"], model_buf)
+                model_bytes = st.session_state.get("gender_model_bytes")
+                if not model_bytes:
+                    model_bytes = serialize_gender_model(st.session_state["gender_model"])
+                    st.session_state["gender_model_bytes"] = model_bytes
 
                 dl_col, test_col = st.columns([1, 2])
                 with dl_col:
                     st.download_button(
                         label="📥 Download `gender_predictor_model.pkl`",
-                        data=model_buf.getvalue(),
+                        data=model_bytes,
                         file_name="gender_predictor_model.pkl",
                         mime="application/octet-stream",
                         type="primary",
